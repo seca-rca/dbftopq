@@ -1,0 +1,6 @@
+/target
+/testdata
+/out
+.vscode
+perf.data*
+Makefile

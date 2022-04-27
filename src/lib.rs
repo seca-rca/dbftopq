@@ -1,5 +1,5 @@
-use std::fs;
 use packed_struct::prelude::*;
+use std::convert::TryInto;
 use std::fmt;
 use std::str;
 use std::str::FromStr;
@@ -8,16 +8,10 @@ use std::borrow::Cow;
 use std::i32;
 use std::convert::TryFrom;
 use parquet::{
-    basic::{LogicalType, Repetition, Type as PhysicalType},
-    schema::{printer, types::Type},
-    file::{
-        properties::WriterProperties,
-        writer::{FileWriter, SerializedFileWriter}
-    },
+    basic::{LogicalType, Repetition, Type as PhysicalType, TimestampType, TimeUnit},
+    schema::{types::Type},
 };
-use parquet::column::writer::ColumnWriter;
 use std::sync::Arc;
-use std::path::Path;
 
 pub enum EncodingLabel {
     Enc(&'static [u8]),
@@ -188,7 +182,11 @@ impl DBFHeader {
     }
 
     pub fn calc_filesize(&self) -> usize {
-        self.headerlen as usize + self.numrecords as usize * self.recordlen as usize
+        self.headerlen as usize + self.calc_datasize()
+    }
+
+    pub fn calc_datasize(&self) -> usize {
+        self.numrecords as usize * self.recordlen as usize
     }
 
     pub fn to_string(&self) -> String {
@@ -212,13 +210,13 @@ impl DBFHeader {
 pub struct DBFField {
     _name: [u8; 11],
     _dtype: u8,
-    address: u32,
-    length: u8,
-    decimal: u8,
-    flags: u8,
-    reserved1: ReservedZero<packed_bits::Bits32>,
-    reserved2: ReservedZero<packed_bits::Bits8>,
-    reserved3: ReservedZero<packed_bits::Bits64>,
+    pub address: u32,
+    pub length: u8,
+    pub decimal: u8,
+    pub flags: u8,
+    pub reserved1: ReservedZero<packed_bits::Bits32>,
+    pub reserved2: ReservedZero<packed_bits::Bits8>,
+    pub reserved3: ReservedZero<packed_bits::Bits64>,
 }
 
 pub trait DateTimestamp {
@@ -237,6 +235,8 @@ pub enum DecodeError {
     NoDecoderFound
 }
 
+// Writing NULL to Parquet: https://stackoverflow.com/questions/51333205/write-null-value-to-parquet-file
+//
 impl DBFField {
     pub fn name(&self) -> &str {
         // SAFETY: we rely on the field being ascii
@@ -274,13 +274,13 @@ impl DBFField {
                             def_levels.push(1);
                         },
                         None => {
-                            values.push(parquet::data_type::ByteArray::from(Vec::new()));
+                            //values.push(parquet::data_type::ByteArray::from(Vec::new()));
                             def_levels.push(0);
                         }
                     }
                 },
                 Err(_) => {
-                    values.push(parquet::data_type::ByteArray::from(Vec::new()));
+                    //values.push(parquet::data_type::ByteArray::from(Vec::new()));
                     def_levels.push(0);
                 }
             }
@@ -319,7 +319,7 @@ impl DBFField {
                     def_levels.push(1);
                 },
                 None => {
-                    values.push(false);
+                    //values.push(false);
                     def_levels.push(0);
                 }
             }
@@ -349,7 +349,7 @@ impl DBFField {
                     def_levels.push(1);
                 },
                 None => {
-                    values.push(0);
+                    //values.push(0);
                     def_levels.push(0);
                 }
             }
@@ -359,12 +359,14 @@ impl DBFField {
     }
 
     pub fn parse_i(buf: &[u8]) -> Option<i32> {
-        let ibuf = <[u8; 4]>::try_from(buf);
+        /*let ibuf = <[u8; 4]>::try_from(buf);
 
         return match ibuf {
             Ok(b) => Some(i32::from_le_bytes(b)),
             Err(_) => None
-        };
+        };*/
+
+        return Some(i32::from_le_bytes(buf.try_into().unwrap()))
     }
 
     pub fn load_float<'a>(&self, buf: &'a [u8], header: &DBFHeader) -> (Vec<f32>, Vec<i16>) {
@@ -380,7 +382,7 @@ impl DBFField {
                     def_levels.push(1);
                 },
                 None => {
-                    values.push(0.0);
+                    //values.push(0.0);
                     def_levels.push(0);
                 }
             }
@@ -404,7 +406,7 @@ impl DBFField {
         let mut def_levels: Vec<i16> = Vec::with_capacity(header.numrecords as usize);
 
         for i in 0..header.numrecords {
-            let res = Self::parse_i(self.record_bytes(buf, i as usize, header));
+            let res = Self::parse_d(self.record_bytes(buf, i as usize, header));
 
             match res {
                 Some(s) => {
@@ -412,11 +414,14 @@ impl DBFField {
                     def_levels.push(1);
                 },
                 None => {
-                    values.push(0);
+                    //values.push(0);
                     def_levels.push(0);
                 }
             }
         }
+
+        //let sum: i16 = def_levels.iter().sum();
+        //println!("Len values: {}, sum def levels: {}", values.len(), sum);
         
         return (values, def_levels);
     }
@@ -440,13 +445,101 @@ impl DBFField {
             Err(_) => return None
         };
 
+        //println!("Bytes: {:?}", &buf);
+        //println!("Str: {}", unsafe { str::from_utf8_unchecked(&buf) });
+
         let date = match chrono::NaiveDate::from_ymd_opt(y, m, d) {
             Some(d) => d,
             None => return None
         };
 
-        return Option::Some(date.timestamp());
+        //println!("Date: {}", date);
+
+        let duration = date.signed_duration_since(chrono::NaiveDate::from_ymd(1970, 1, 1));
+        let days = i32::try_from(duration.num_days());
+
+        // https://github.com/ClickHouse/ClickHouse/blob/d7b88d76830e641130715b35194f350347e7caae/src/Processors/Formats/Impl/ArrowColumnToCHColumn.cpp#L167
+        // https://github.com/ClickHouse/ClickHouse/blob/d9e5ca21195a2689725488ff2519ff2233f1bbd3/src/Common/DateLUTImpl.h#L22
+        // https://github.com/ClickHouse/ClickHouse/issues/36459
+        let date_lut_max_extend_day_num: i32 = 0x20000 - 16436;
+
+        //println!("Duration: {}", duration);
+        //println!("Days: {}", days.ok()?);
+
+        match days {
+            Ok(d) => {
+                if d <= date_lut_max_extend_day_num {
+                    return Some(d);
+                } else {
+                    return Some(date_lut_max_extend_day_num)
+                }
+            },
+            Err(_) => return None
+        }
     }
+
+    pub fn load_datetime<'a>(&self, buf: &'a [u8], header: &DBFHeader) -> (Vec<i64>, Vec<i16>) {
+        let mut values: Vec<i64> = Vec::with_capacity(header.numrecords as usize);
+        let mut def_levels: Vec<i16> = Vec::with_capacity(header.numrecords as usize);
+
+        for i in 0..header.numrecords {
+            let res = Self::parse_t(self.record_bytes(buf, i as usize, header));
+
+            match res {
+                Some(s) => {
+                    values.push(s);
+                    def_levels.push(1);
+                },
+                None => {
+                    //values.push(0);
+                    def_levels.push(0);
+                }
+            }
+        }
+
+        //let sum: i16 = def_levels.iter().sum();
+        //println!("Len values: {}, sum def levels: {}", values.len(), sum);
+        
+        return (values, def_levels);
+    }
+
+    // thanks: http://www.independent-software.com/dbase-dbf-dbt-file-format.html#reading-records
+    //
+    // DateTime values are encoded as 32 bits numbers.
+    // The high word is the date, encoded as the number of days since Jan 1, 4713BC,
+    // and the low word is the time, encoded as (Hours * 3,600,000) + (Minutes * 60,000) + (Seconds * 1,000)
+    // (the number of milliseconds since midnight).
+    pub fn parse_t(buf: &[u8]) -> Option<i64> {
+        let base_foxpro_millis: i64 = 210866803200000;
+        let day_to_millis_factor: i64 = 24 * 60 * 60 * 1000;
+
+        let (dbuf, tbuf) = buf.split_at(std::mem::size_of::<i32>());
+
+        let date_days = i32::from_le_bytes(dbuf.try_into().unwrap()) as i64;
+        let time_millis = i32::from_le_bytes(tbuf.try_into().unwrap()) as i64;
+
+        let timestamp = date_days * day_to_millis_factor - base_foxpro_millis + time_millis;
+
+        // make sure we are in bounds of datetime64[ns]
+        // https://github.com/apache/arrow/blob/a9f2091f8518590c72d25452dc60c8173ee6223c/cpp/src/arrow/compute/kernels/scalar_cast_temporal.cc#L59
+        // https://github.com/apache/arrow/blob/b0c75dee34de65834e5a83438e6581f90970fd3d/python/pyarrow/table.pxi#L2591
+        let min_val = i64::MIN / 1000000;
+        let max_val = i64::MAX / 1000000;
+
+        if timestamp < min_val {
+            return Some(min_val);
+        }
+        else if timestamp > max_val {
+            return Some(max_val);
+        }
+
+        //let datetime = Utc.timestamp_millis(date_days * day_to_millis_factor - base_foxpro_millis + time_millis);
+        //print!("{}\n", date_days * day_to_millis_factor - base_foxpro_millis + time_millis);
+        return Some(timestamp);
+
+        //return None;
+    }
+
 
     pub fn to_string(&self) -> String {
         format!(
@@ -506,7 +599,7 @@ impl<'a> Iterator for DBFFields<'a> {
         }
 
         fn next(&mut self) -> Option<Self::Item> {
-            if self.offset >= self.len() {
+            if self.offset >= self.len {
                 return None
             }
 
@@ -521,18 +614,25 @@ impl<'a> Iterator for DBFFields<'a> {
 }
 
 pub struct DBFFile<'a> {
-    header: DBFHeader,
-    fields: DBFFields<'a>
+    pub header: DBFHeader,
+    pub fields: DBFFields<'a>
 }
 
-pub struct DBFFieldToParquetColumn {
-    in_field: DBFField,
-    out_field: Option<Type>
+pub struct DBFMapping {
+    pub in_field: DBFField,
+    pub out_field: Option<Type>
 }
 
-impl DBFFieldToParquetColumn {
+impl DBFMapping {
     pub fn new(in_field: DBFField, out_field: Option<Type>) -> Self {
         Self { in_field: in_field, out_field: out_field }
+    }
+
+    pub fn to_string(&self) -> String {
+        match &self.out_field {
+            Some(out_field) => return format!("{} [{}] => {} [{}]", self.in_field.name(), self.in_field.dtype(), out_field.name(), out_field.get_physical_type()),
+            None => return format!("{} [{}] => ()", self.in_field.name(), self.in_field.dtype())
+        }
     }
 }
 
@@ -557,9 +657,9 @@ pub enum DBFError {
 }
 
 impl<'a> DBFFile<'a> {
-    pub fn to_parquet_columns(&self) -> Vec<DBFFieldToParquetColumn> {
+    pub fn mappings_all(&self) -> Vec<DBFMapping> {
         let in_fields = self.fields;
-        let mut out_fields: Vec<DBFFieldToParquetColumn> = Vec::with_capacity(in_fields.len());
+        let mut out_fields: Vec<DBFMapping> = Vec::with_capacity(in_fields.len());
 
         for in_field in in_fields {
             let field_name = in_field.name().to_lowercase();
@@ -569,58 +669,62 @@ impl<'a> DBFFile<'a> {
             match in_field.dtype() {
                 'C' => {
                     out_field = Some(Type::primitive_type_builder(&field_name, PhysicalType::BYTE_ARRAY)
-                    .with_logical_type(LogicalType::UTF8)
-                    .with_repetition(Repetition::REQUIRED)
+                    .with_logical_type(Some(LogicalType::STRING(Default::default())))
+                    .with_repetition(Repetition::OPTIONAL)
                     .build()
                     .unwrap());
                 },
                 'D' => {
                     out_field = Some(Type::primitive_type_builder(&field_name, PhysicalType::INT32)
-                    .with_logical_type(LogicalType::DATE)
-                    .with_repetition(Repetition::REQUIRED)
+                    .with_logical_type(Some(LogicalType::DATE(Default::default())))
+                    .with_repetition(Repetition::OPTIONAL)
                     .build()
                     .unwrap());
                 },
                 'L' => {
                     out_field = Some(Type::primitive_type_builder(&field_name, PhysicalType::BOOLEAN)
-                    .with_repetition(Repetition::REQUIRED)
+                    .with_repetition(Repetition::OPTIONAL)
                     .build()
                     .unwrap());
                 },
                 'F' | 'N' => {
                     out_field = Some(Type::primitive_type_builder(&field_name, PhysicalType::FLOAT)
-                    .with_repetition(Repetition::REQUIRED)
+                    .with_repetition(Repetition::OPTIONAL)
                     .build()
                     .unwrap());
                 },
                 'I' => {
                     out_field = Some(Type::primitive_type_builder(&field_name, PhysicalType::INT32)
-                    .with_repetition(Repetition::REQUIRED)
+                    .with_repetition(Repetition::OPTIONAL)
                     .build()
                     .unwrap());
                 },
+                'T' => {
+                    out_field = Some(Type::primitive_type_builder(&field_name, PhysicalType::INT64)
+                    .with_logical_type(Some(LogicalType::TIMESTAMP(TimestampType::new(false, TimeUnit::MILLIS(Default::default())))))
+                    .with_repetition(Repetition::OPTIONAL)
+                    .build()
+                    .unwrap());
+                }
                 _ => ()
             }
 
-            out_fields.push(DBFFieldToParquetColumn::new(in_field, out_field));
+            out_fields.push(DBFMapping::new(in_field, out_field));
         }
     
         return out_fields;
     }
 
-    pub fn linked_fields<'c>(fields: &'c [DBFFieldToParquetColumn]) -> Vec<&DBFFieldToParquetColumn> {
-        return fields.iter().filter(|f| f.out_field.is_some()).collect();
-    }
-
-    pub fn to_parquet_schema<'c>(linked_fields: &'c [&DBFFieldToParquetColumn]) -> Type {
-        let mut out_fields: Vec<parquet::schema::types::TypePtr> = linked_fields.iter().map(|linked_field| {
-            // UNWRAP: we know this is Some(), since we filter in linked_fields
-            let out_ref = linked_field.out_field.as_ref().unwrap();
+    pub fn to_parquet_schema<'c>(mappings: &'c [DBFMapping]) -> (Vec<DBFField>, Arc<Type>) {
+        let mut in_fields: Vec<DBFField> = vec![];
+        let mut out_fields: Vec<parquet::schema::types::TypePtr> = mappings.iter().filter(|m| m.out_field.is_some()).map(|mapping| {
+            in_fields.push(mapping.in_field.clone());
+            let out_ref = mapping.out_field.as_ref().unwrap();
             Arc::new(out_ref.clone())
         }).collect();
 
         // UNWRAP: we know our types are OK.
-        return Type::group_type_builder("schema").with_fields(&mut out_fields).build().unwrap();
+        return (in_fields, Arc::new(Type::group_type_builder("schema").with_fields(&mut out_fields).build().unwrap()));
     }
 
     pub fn new(data: &'a [u8]) -> Result<Self, DBFError> {
@@ -641,150 +745,5 @@ impl<'a> DBFFile<'a> {
             Ok(fields) => return Ok(Self {header: header, fields: fields}),
             Err(err) => return Err(err)
         }
-    }
-
-    pub fn dbf_to_parquet<'c, 'd, W>(in_file: &'c str, out_file: &'d str, out: &mut Option<W>) -> Result<(), DBFToParquetError>
-    where W: std::io::Write + std::marker::Send {
-        let now = std::time::Instant::now();
-
-        let buf = match fs::read(in_file) {
-            Ok(buf) => buf,
-            Err(err) => return Err(DBFToParquetError::IOError(err))
-        };
-        
-        let in_file = match DBFFile::new(&buf) {
-            Ok(in_file) => in_file,
-            Err(err) => return Err(DBFToParquetError::DBFError(err))
-        };
-
-        let header = in_file.header;
-
-        if let Some(out) = out {
-            writeln!(out, "{}", header.to_string());
-        }
-    
-        let enc = header.encoding();
-    
-        let columns = in_file.to_parquet_columns();
-        let linked_fields = DBFFile::linked_fields(&columns);
-        let schema = Arc::new(DBFFile::to_parquet_schema(&linked_fields[..]));
-
-        if let Some(out) = out {
-            printer::print_schema(out, &schema);
-        }
-    
-        let path = Path::new(out_file);
-    
-        let prop_builder = WriterProperties::builder()
-        .set_created_by("dbf-to-parquet <https://github.com/seca-rca/dbf-to-parquet>".to_string())
-        .set_statistics_enabled(false)
-        .set_compression(parquet::basic::Compression::UNCOMPRESSED);
-    
-        let props = Arc::new(prop_builder.build());
-        let file = match fs::File::create(&path) {
-            Ok(file) => file,
-            Err(err) => return Err(DBFToParquetError::IOError(err))
-        };
-    
-        let mut writer = match SerializedFileWriter::new(file, schema, props) {
-            Ok(writer) => writer,
-            Err(err) => return Err(DBFToParquetError::ParquetError(err))
-        };
-
-        let mut row_group_writer = match writer.next_row_group() {
-            Ok(writer) => writer,
-            Err(err) => return Err(DBFToParquetError::ParquetError(err))
-        };
-    
-        let mut column_index = 0;
-    
-        loop {
-            let now = std::time::Instant::now();
-
-            let mut col_writer = match row_group_writer.next_column() {
-                Ok(col_writer) => {
-                    match col_writer {
-                        Some(col_writer) => col_writer,
-                        None => break
-                    }
-                }
-                Err(err) => return Err(DBFToParquetError::ParquetError(err))
-            };
-
-            let in_field = &linked_fields[column_index].in_field;
-            
-            match col_writer {
-                ColumnWriter::BoolColumnWriter(ref mut c) => {
-
-                    let (values, def_levels) = in_field.load_bool(&buf, &header);
-                    match c.write_batch(&values, Some(&def_levels), None) {
-                        Ok(_) => (),
-                        Err(err) => return Err(DBFToParquetError::ParquetError(err))
-                    }
-                },
-                ColumnWriter::ByteArrayColumnWriter(ref mut c) => {
-                    let (values, def_levels) = in_field.load_string(&buf, &enc, &header);
-                    match c.write_batch(&values[..], Some(&def_levels), None) {
-                        Ok(_) => (),
-                        Err(err) => return Err(DBFToParquetError::ParquetError(err))
-                    }
-                },
-                ColumnWriter::FloatColumnWriter(ref mut c) => {
-                    let (values, def_levels) = in_field.load_float(&buf, &header);
-                    match c.write_batch(&values, Some(&def_levels), None) {
-                        Ok(_) => (),
-                        Err(err) => return Err(DBFToParquetError::ParquetError(err))
-                    }
-                },
-                ColumnWriter::Int32ColumnWriter(ref mut c) => {
-                    match in_field.dtype() {
-                        'I' => {
-                            let (values, def_levels) = in_field.load_int32(&buf, &header);
-                            match c.write_batch(&values, Some(&def_levels), None) {
-                                Ok(_) => (),
-                                Err(err) => return Err(DBFToParquetError::ParquetError(err))
-                            }
-                        },
-                        'D' => {
-                            let (values, def_levels) = in_field.load_date(&buf, &header);
-                            match c.write_batch(&values, Some(&def_levels), None) {
-                                Ok(_) => (),
-                                Err(err) => return Err(DBFToParquetError::ParquetError(err))
-                            }
-                        },
-                        _ => ()
-                    }
-                    
-                },
-                _ => ()
-            }
-    
-            match row_group_writer.close_column(col_writer) {
-                Ok(_) => (),
-                Err(err) => return Err(DBFToParquetError::ParquetError(err))
-            }
-
-            if let Some(out) = out {
-                writeln!(out, "Converted field {} [{}] in {} us", in_field.name(), in_field.dtype(), now.elapsed().as_micros());
-            }
-
-            column_index += 1;
-        }
-
-        match writer.close_row_group(row_group_writer) {
-            Ok(_) => (),
-            Err(err) => return Err(DBFToParquetError::ParquetError(err))
-        }
-
-        match writer.close() {
-            Ok(_) => (),
-            Err(err) => return Err(DBFToParquetError::ParquetError(err))
-        }
-
-        if let Some(out) = out {
-            writeln!(out, "Runtime: {} ms", now.elapsed().as_millis());
-        }
-
-        Ok(())
     }
 }
